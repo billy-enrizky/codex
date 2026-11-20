@@ -90,6 +90,8 @@ use codex_protocol::auth::AuthMode;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::Verbosity as VerbosityConfig;
+use codex_protocol::models::AgentMessageInputContent;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::ToolResultBody;
 use codex_protocol::openai_models::ModelInfo;
@@ -577,6 +579,53 @@ fn response_items_equal_ignoring_internal_metadata(
     let mut current = current.clone();
     current.clear_internal_chat_message_metadata_passthrough();
     previous == current
+}
+
+// The public Responses schema has no `agent_message`. Providers without Responses Lite can only
+// receive readable text. Direct multi-agent calls store plaintext in `encrypted_content`; real
+// OpenAI payloads are Fernet tokens and cannot be decoded here.
+fn replace_agent_messages_with_user_messages(input: &mut Vec<ResponseItem>) {
+    input.retain_mut(|item| {
+        if !matches!(item, ResponseItem::AgentMessage { .. }) {
+            return true;
+        }
+        let ResponseItem::AgentMessage { content, .. } =
+            std::mem::replace(item, ResponseItem::Other)
+        else {
+            unreachable!("checked above");
+        };
+        let Some(text) = agent_message_text_for_standard_provider(&content) else {
+            return false;
+        };
+        *item = ResponseItem::Message {
+            encrypted_content: None,
+            status: None,
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText { text }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        };
+        true
+    });
+}
+
+fn agent_message_text_for_standard_provider(
+    content: &[AgentMessageInputContent],
+) -> Option<String> {
+    let mut text = String::new();
+    for part in content {
+        match part {
+            AgentMessageInputContent::InputText { text: part } => text.push_str(part),
+            AgentMessageInputContent::EncryptedContent { encrypted_content }
+                if !encrypted_content.starts_with("gAAAAA") =>
+            {
+                text.push_str(encrypted_content);
+            }
+            AgentMessageInputContent::EncryptedContent { .. } => {}
+        }
+    }
+    (!text.trim().is_empty()).then_some(text)
 }
 
 impl WebsocketSession {
@@ -1297,6 +1346,9 @@ impl ModelClient {
             }
         }
         if !is_openai {
+            if !model_info.use_responses_lite {
+                replace_agent_messages_with_user_messages(&mut input);
+            }
             for item in &mut input {
                 item.clear_internal_chat_message_metadata_passthrough();
                 if !matches!(

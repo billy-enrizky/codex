@@ -45,10 +45,12 @@ use codex_model_provider_info::WireApi;
 use codex_model_provider_info::create_oss_provider_with_base_url;
 use codex_models_manager::manager::SharedModelsManager;
 use codex_otel::SessionTelemetry;
+use codex_protocol::ResponseItemId;
 use codex_protocol::ThreadId;
 use codex_protocol::auth::AuthMode;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
+use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ExecutedToolCall;
@@ -540,6 +542,151 @@ fn test_model_info() -> ModelInfo {
         "experimental_supported_tools": []
     }))
     .expect("deserialize test model info")
+}
+
+fn agent_message(content: Vec<AgentMessageInputContent>) -> ResponseItem {
+    ResponseItem::AgentMessage {
+        id: Some(ResponseItemId::with_suffix("amsg", "worker")),
+        author: "/root".to_string(),
+        recipient: "/root/worker".to_string(),
+        content,
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
+#[test]
+fn non_openai_requests_replace_agent_messages_with_user_messages() -> anyhow::Result<()> {
+    let plaintext = agent_message(vec![AgentMessageInputContent::InputText {
+        text: "Subagent finished".to_string(),
+    }]);
+    let plaintext_agent_payload = agent_message(vec![
+        AgentMessageInputContent::InputText {
+            text: "Message Type: MESSAGE\nPayload:\n".to_string(),
+        },
+        AgentMessageInputContent::EncryptedContent {
+            encrypted_content: "opaque".to_string(),
+        },
+    ]);
+    let ciphertext = agent_message(vec![AgentMessageInputContent::EncryptedContent {
+        encrypted_content: "gAAAAAopaque".to_string(),
+    }]);
+    let user_message = ResponseItem::Message {
+        encrypted_content: None,
+        status: None,
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "Continue".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let prompt = Prompt {
+        input: vec![
+            plaintext,
+            plaintext_agent_payload,
+            ciphertext,
+            user_message.clone(),
+        ],
+        base_instructions: BaseInstructions {
+            text: String::new(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let original_input = prompt.input.clone();
+
+    let client = test_model_client(SessionSource::Cli);
+    let responses_metadata = test_responses_metadata_for_client(
+        &client,
+        /*turn_id*/ None,
+        format!("{}:0", client.state.thread_id),
+        /*parent_thread_id*/ None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    let request = client.build_responses_request(
+        &prompt,
+        &test_model_info(),
+        /*effort*/ None,
+        codex_protocol::config_types::ReasoningSummary::None,
+        /*service_tier*/ None,
+        &responses_metadata,
+        /*include_internal*/ false,
+    )?;
+    assert_eq!(
+        request.input,
+        vec![
+            ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "Subagent finished".to_string(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::Message {
+                encrypted_content: None,
+                status: None,
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "Message Type: MESSAGE\nPayload:\nopaque".to_string(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+            user_message,
+        ]
+    );
+    assert!(
+        serde_json::to_value(&request)?["input"]
+            .as_array()
+            .expect("input array")
+            .iter()
+            .all(|item| item["type"] != "agent_message")
+    );
+    assert_eq!(prompt.input, original_input);
+
+    let mut responses_lite_model = test_model_info();
+    responses_lite_model.use_responses_lite = true;
+    let responses_lite_request = client.build_responses_request(
+        &prompt,
+        &responses_lite_model,
+        /*effort*/ None,
+        codex_protocol::config_types::ReasoningSummary::None,
+        /*service_tier*/ None,
+        &responses_metadata,
+        /*include_internal*/ false,
+    )?;
+    assert_eq!(responses_lite_request.input, original_input);
+
+    let provider =
+        ModelProviderInfo::create_openai_provider(Some("https://api.openai.com/v1".to_string()));
+    let mut openai_client = test_model_client(SessionSource::Cli);
+    Arc::get_mut(&mut openai_client.state)
+        .expect("test client should have unique session state")
+        .provider = create_model_provider(provider, /*auth_manager*/ None);
+    let responses_metadata = test_responses_metadata_for_client(
+        &openai_client,
+        /*turn_id*/ None,
+        format!("{}:0", openai_client.state.thread_id),
+        /*parent_thread_id*/ None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    let request = openai_client.build_responses_request(
+        &prompt,
+        &test_model_info(),
+        /*effort*/ None,
+        codex_protocol::config_types::ReasoningSummary::None,
+        /*service_tier*/ None,
+        &responses_metadata,
+        /*include_internal*/ false,
+    )?;
+    assert_eq!(request.input, original_input);
+    Ok(())
 }
 
 fn output_with_tool_result_metadata(metadata: ToolResultMetadata) -> ResponseItem {
